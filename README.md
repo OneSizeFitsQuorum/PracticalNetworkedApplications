@@ -1,0 +1,1 @@
+Record of a Rust novice learning [Talent Plan Rust Lab](https://github.com/pingcap/talent-plan/tree/master/courses/rust)
