@@ -1,6 +1,4 @@
-use crate::Command;
-use crate::KVStoreError::KeyNotFound;
-use crate::{KVStoreError, Result};
+use crate::{Command, KVStoreError, KvsEngine, Result};
 use serde_json::Deserializer;
 use std::collections::HashMap;
 use std::fs::{create_dir_all, read_dir, remove_file, File, OpenOptions};
@@ -10,11 +8,12 @@ use std::path::PathBuf;
 
 const MAX_USELESS_SIZE: u64 = 1024;
 
-/** A KvStore stores key/value pairs in HashMap.
+/** A KvStore stores key/value pairs using BitCask.
 # Example
 ```
 use std::env;
 use kvs::{KvStore, Result};
+use crate::kvs::KvsEngine;
 # fn try_main() -> Result<()> {
 
 let mut store = KvStore::open(env::current_dir()?)?;
@@ -80,81 +79,6 @@ impl KvStore {
         }
 
         Ok(store)
-    }
-
-    /// Set the value of a string key to a string. Return an error if the value is not written successfully.
-    pub fn set(&mut self, key: String, value: String) -> Result<()> {
-        let command = Command::SET(key, value);
-        let data = serde_json::to_vec(&command)?;
-
-        let offset = self.current_writer.get_position();
-        self.current_writer.write_all(&data)?;
-        self.current_writer.flush()?;
-        let length = self.current_writer.get_position() - offset;
-        let file_number = self.current_file_number;
-
-        if let Command::SET(key, _) = command {
-            self.useless_size += self
-                .index
-                .insert(
-                    key,
-                    CommandPosition {
-                        offset,
-                        length,
-                        file_number,
-                    },
-                )
-                .map(|cp| cp.length)
-                .unwrap_or(0);
-        }
-
-        if self.useless_size > MAX_USELESS_SIZE {
-            self.compact()?;
-        }
-
-        Ok(())
-    }
-
-    /// Get the string value of a string key. If the key does not exist, return None. Return an error if the value is not read successfully.
-    pub fn get(&mut self, key: String) -> Result<Option<String>> {
-        if let Some(position) = self.index.get(&key) {
-            let source_reader = self
-                .current_readers
-                .get_mut(&position.file_number)
-                .expect("Can not find key in files but it is in memory");
-            source_reader.seek(SeekFrom::Start(position.offset))?;
-            let data_reader = source_reader.take(position.length as u64);
-
-            if let Command::SET(_, value) = serde_json::from_reader(data_reader)? {
-                Ok(Some(value))
-            } else {
-                Err(KVStoreError::UnknownCommandType)
-            }
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Remove a given key. Return an error if the key does not exist or is not removed successfully.
-    pub fn remove(&mut self, key: String) -> Result<()> {
-        if self.index.get(&key).is_some() {
-            self.useless_size += self.index.remove(&key).map(|cp| cp.length).unwrap_or(0);
-
-            let command = serde_json::to_vec(&Command::RM(key))?;
-            let offset = self.current_writer.get_position();
-            self.current_writer.write_all(&command)?;
-            self.current_writer.flush()?;
-
-            self.useless_size += self.current_writer.get_position() - offset;
-
-            if self.useless_size > MAX_USELESS_SIZE {
-                self.compact()?;
-            }
-
-            Ok(())
-        } else {
-            Err(KeyNotFound)
-        }
     }
 
     fn create_new_file(&mut self) -> Result<()> {
@@ -267,9 +191,88 @@ impl KvStore {
             remove_file(self.dir_path.join(format!("data_{}.txt", number)))?;
         }
 
+        self.useless_size = 0;
+
         self.create_new_file()?;
 
         Ok(())
+    }
+}
+
+impl KvsEngine for KvStore {
+    /// Set the value of a string key to a string. Return an error if the value is not written successfully.
+    fn set(&mut self, key: String, value: String) -> Result<()> {
+        let command = Command::SET(key, value);
+        let data = serde_json::to_vec(&command)?;
+
+        let offset = self.current_writer.get_position();
+        self.current_writer.write_all(&data)?;
+        self.current_writer.flush()?;
+        let length = self.current_writer.get_position() - offset;
+        let file_number = self.current_file_number;
+
+        if let Command::SET(key, _) = command {
+            self.useless_size += self
+                .index
+                .insert(
+                    key,
+                    CommandPosition {
+                        offset,
+                        length,
+                        file_number,
+                    },
+                )
+                .map(|cp| cp.length)
+                .unwrap_or(0);
+        }
+
+        if self.useless_size > MAX_USELESS_SIZE {
+            self.compact()?;
+        }
+
+        Ok(())
+    }
+
+    /// Get the string value of a string key. If the key does not exist, return None. Return an error if the value is not read successfully.
+    fn get(&mut self, key: String) -> Result<Option<String>> {
+        if let Some(position) = self.index.get(&key) {
+            let source_reader = self
+                .current_readers
+                .get_mut(&position.file_number)
+                .expect("Can not find key in files but it is in memory");
+            source_reader.seek(SeekFrom::Start(position.offset))?;
+            let data_reader = source_reader.take(position.length as u64);
+
+            if let Command::SET(_, value) = serde_json::from_reader(data_reader)? {
+                Ok(Some(value))
+            } else {
+                Err(KVStoreError::UnknownCommandType)
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Remove a given key. Return an error if the key does not exist or is not removed successfully.
+    fn remove(&mut self, key: String) -> Result<()> {
+        if self.index.get(&key).is_some() {
+            self.useless_size += self.index.remove(&key).map(|cp| cp.length).unwrap_or(0);
+
+            let command = serde_json::to_vec(&Command::RM(key))?;
+            let offset = self.current_writer.get_position();
+            self.current_writer.write_all(&command)?;
+            self.current_writer.flush()?;
+
+            self.useless_size += self.current_writer.get_position() - offset;
+
+            if self.useless_size > MAX_USELESS_SIZE {
+                self.compact()?;
+            }
+
+            Ok(())
+        } else {
+            Err(KVStoreError::KeyNotFound)
+        }
     }
 }
 
