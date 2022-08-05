@@ -1,6 +1,9 @@
 use clap::{arg, command, ArgMatches};
+use kvs::thread_pool::{SharedQueueThreadPool, ThreadPool};
 use kvs::{EngineType, KVStoreError, KvServer, KvStore, KvsEngine, Result, SledKvsEngine};
 use log::{info, LevelFilter};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::{env, process};
 
 fn main() -> Result<()> {
@@ -71,7 +74,11 @@ fn judge_engine(engine: Option<String>) -> Result<EngineType> {
 }
 
 fn run_server<E: KvsEngine>(engine: E, addr: &String) -> Result<()> {
-    let mut server = KvServer::new(engine);
+    let mut server = KvServer::new(
+        engine,
+        SharedQueueThreadPool::new(num_cpus::get())?,
+        Arc::new(AtomicBool::new(false)),
+    );
     server.serve(addr)?;
     Ok(())
 }

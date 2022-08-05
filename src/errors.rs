@@ -23,6 +23,10 @@ pub enum KVStoreError {
     #[fail(display = "Utf8 Error {}", _0)]
     Utf8Error(#[cause] string::FromUtf8Error),
 
+    /// Build ThreadPool Error
+    #[fail(display = "Build ThreadPool Error {}", _0)]
+    ThreadPoolBuildError(#[cause] rayon::ThreadPoolBuildError),
+
     /// Key not found error
     #[fail(display = "Key not found")]
     KeyNotFound,
@@ -65,5 +69,11 @@ impl From<sled::Error> for KVStoreError {
 impl From<string::FromUtf8Error> for KVStoreError {
     fn from(err: string::FromUtf8Error) -> Self {
         KVStoreError::Utf8Error(err)
+    }
+}
+
+impl From<rayon::ThreadPoolBuildError> for KVStoreError {
+    fn from(err: rayon::ThreadPoolBuildError) -> Self {
+        KVStoreError::ThreadPoolBuildError(err)
     }
 }

@@ -16,7 +16,7 @@ fn write_benchmark(c: &mut Criterion) {
                 let store = KvStore::open(temp_dir.path()).expect("unable to init KvStore");
                 store
             },
-            |mut store| {
+            |store| {
                 for i in &range {
                     store
                         .set(format!("key{}", i), format!("value{}", i))
@@ -35,7 +35,7 @@ fn write_benchmark(c: &mut Criterion) {
                     SledKvsEngine::open(temp_dir.path()).expect("unable to init SledKvsEngine");
                 store
             },
-            |mut store| {
+            |store| {
                 for i in &range {
                     store
                         .set(format!("key{}", i), format!("value{}", i))
@@ -58,7 +58,7 @@ fn read_benchmark(c: &mut Criterion) {
             || {
                 let temp_dir =
                     TempDir::new().expect("unable to create temporary working directory");
-                let mut store = KvStore::open(temp_dir.path()).expect("unable to init KvStore");
+                let store = KvStore::open(temp_dir.path()).expect("unable to init KvStore");
                 for i in &write_range {
                     store
                         .set(format!("key{}", i), format!("value{}", i))
@@ -66,7 +66,7 @@ fn read_benchmark(c: &mut Criterion) {
                 }
                 store
             },
-            |mut store| {
+            |store| {
                 for i in &read_range {
                     store
                         .get(format!("key{}", i))
@@ -81,7 +81,7 @@ fn read_benchmark(c: &mut Criterion) {
             || {
                 let temp_dir =
                     TempDir::new().expect("unable to create temporary working directory");
-                let mut store =
+                let store =
                     SledKvsEngine::open(temp_dir.path()).expect("unable to init SledKvsEngine");
                 for i in &write_range {
                     store
@@ -90,7 +90,7 @@ fn read_benchmark(c: &mut Criterion) {
                 }
                 store
             },
-            |mut store| {
+            |store| {
                 for i in &read_range {
                     store
                         .get(format!("key{}", i))

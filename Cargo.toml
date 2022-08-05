@@ -16,6 +16,9 @@ serde_json = "1.0.82"
 log = "0.4.17"
 env_logger = "0.9.0"
 sled = "0.34.7"
+dashmap = "5.3.4"
+num_cpus = "1.13.1"
+rayon = "1.5.3"
 
 [dev-dependencies]
 assert_cmd = "2.0.4"
@@ -24,8 +27,14 @@ tempfile = "3.3.0"
 walkdir = "2.3.2"
 criterion = { version = "0.3.6", features = ["html_reports"] }
 rand = "0.8.5"
+panic-control = "0.1.4"
+crossbeam-utils = "0.8.11"
 
 [[bench]]
-name = "benches"
+name = "engine"
+harness = false
+
+[[bench]]
+name = "thread_pool"
 harness = false
 

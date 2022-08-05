@@ -1,12 +1,19 @@
 use crate::{Command, KVStoreError, KvsEngine, Result};
+use dashmap::DashMap;
+use log::{info, warn};
 use serde_json::Deserializer;
+use std::cell::RefCell;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs::{create_dir_all, read_dir, remove_file, File, OpenOptions};
 use std::io;
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Take, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
-const MAX_USELESS_SIZE: u64 = 1024;
+const MAX_USELESS_SIZE: u64 = 1024 * 1024;
 
 /** A KvStore stores key/value pairs using BitCask.
 # Example
@@ -27,27 +34,24 @@ assert_eq!(store.get("1".to_owned())?, None);
 # }
 ```
  */
+#[derive(Clone)]
 pub struct KvStore {
-    index: HashMap<String, CommandPosition>,
-    current_readers: HashMap<u64, BufReader<File>>,
-    current_writer: BufWriterWithPosition<File>,
-    current_file_number: u64,
-    dir_path: PathBuf,
-    useless_size: u64,
+    index: Arc<DashMap<String, CommandPosition>>,
+    writer: Arc<Mutex<Writer>>,
+    readers: Reader,
 }
 
 impl KvStore {
     /// Open the KvStore at a given path. Return the KvStore.
     pub fn open(path: impl Into<PathBuf>) -> Result<KvStore> {
-        let dir_path = path.into();
-        create_dir_all(&dir_path)?;
+        let dir_path = Arc::new(path.into());
+        create_dir_all(dir_path.as_path())?;
 
-        let mut index = HashMap::new();
-
-        let mut current_readers = HashMap::new();
+        let mut index = Arc::new(DashMap::new());
+        let mut readers = HashMap::new();
 
         let (current_file_number, useless_size) =
-            Self::recover(&dir_path, &mut current_readers, &mut index)?;
+            Self::recover(&dir_path, &mut readers, &mut index)?;
 
         let current_file_path = dir_path.join(format!("data_{}.txt", current_file_number));
 
@@ -59,53 +63,40 @@ impl KvStore {
         )?;
 
         if current_file_number == 0 {
-            current_readers.insert(
+            readers.insert(
                 current_file_number,
                 BufReader::new(File::open(&current_file_path)?),
             );
         }
 
-        let mut store = KvStore {
-            index,
-            current_readers,
-            current_writer,
-            current_file_number,
-            dir_path,
-            useless_size,
+        let readers = Reader {
+            dir_path: Arc::clone(&dir_path),
+            compaction_number: Arc::new(AtomicU64::new(0)),
+            readers: RefCell::new(readers),
         };
 
-        if store.useless_size > MAX_USELESS_SIZE {
-            store.compact()?;
-        }
+        let writer = Arc::new(Mutex::new(Writer {
+            current_writer,
+            current_file_number,
+            useless_size,
+            dir_path,
+            index: Arc::clone(&index),
+            reader: readers.clone(),
+        }));
 
-        Ok(store)
-    }
-
-    fn create_new_file(&mut self) -> Result<()> {
-        self.current_file_number += 1;
-        let new_file_path = self
-            .dir_path
-            .join(format!("data_{}.txt", self.current_file_number));
-        self.current_writer = BufWriterWithPosition::new(
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&new_file_path)?,
-        )?;
-        self.current_readers.insert(
-            self.current_file_number,
-            BufReader::new(File::open(new_file_path)?),
-        );
-
-        Ok(())
+        Ok(KvStore {
+            readers,
+            writer,
+            index,
+        })
     }
 
     fn recover(
-        dir_path: &PathBuf,
+        dir_path: &Arc<PathBuf>,
         current_readers: &mut HashMap<u64, BufReader<File>>,
-        index: &mut HashMap<String, CommandPosition>,
+        index: &mut Arc<DashMap<String, CommandPosition>>,
     ) -> Result<(u64, u64)> {
-        let mut versions: Vec<u64> = read_dir(dir_path)?
+        let mut versions: Vec<u64> = read_dir(dir_path.as_path())?
             .flat_map(|res| res.map(|e| e.path()))
             .filter(|path| path.is_file() && path.extension() == Some("txt".as_ref()))
             .flat_map(|path| {
@@ -145,7 +136,7 @@ impl KvStore {
                             .unwrap_or(0);
                     }
                     Command::RM(key) => {
-                        useless_size += index.remove(&key).map(|cp| cp.length).unwrap_or(0);
+                        useless_size += index.remove(&key).map(|(_, cp)| cp.length).unwrap_or(0);
                         useless_size += after_offset - before_offset;
                     }
                 };
@@ -156,51 +147,134 @@ impl KvStore {
 
         Ok((*versions.last().unwrap_or(&0), useless_size))
     }
+}
 
-    fn compact(&mut self) -> Result<()> {
-        self.create_new_file()?;
+impl KvsEngine for KvStore {
+    /// Set the value of a string key to a string. Return an error if the value is not written successfully.
+    fn set(&self, key: String, value: String) -> Result<()> {
+        self.writer.lock().unwrap().set(key, value)
+    }
 
-        let mut before_offset = 0;
-        for position in self.index.values_mut() {
-            let source_reader = self
-                .current_readers
-                .get_mut(&position.file_number)
-                .expect("Can not find key in files but it is in memory");
-            source_reader.seek(SeekFrom::Start(position.offset))?;
-            let mut data_reader = source_reader.take(position.length);
-            io::copy(&mut data_reader, &mut self.current_writer)?;
-            let after_offset = self.current_writer.position;
-            *position = CommandPosition {
-                offset: before_offset,
-                length: after_offset - before_offset,
-                file_number: self.current_file_number,
-            };
-            before_offset = after_offset;
+    /// Get the string value of a string key. If the key does not exist, return None. Return an error if the value is not read successfully.
+    fn get(&self, key: String) -> Result<Option<String>> {
+        if let Some(entry) = self.index.get(&key) {
+            self.readers.read_command(entry.value())
+        } else {
+            Ok(None)
         }
-        self.current_writer.flush()?;
+    }
 
-        let delete_file_numbers: Vec<u64> = self
-            .current_readers
+    /// Remove a given key. Return an error if the key does not exist or is not removed successfully.
+    fn remove(&self, key: String) -> Result<()> {
+        self.writer.lock().unwrap().remove(key)
+    }
+}
+
+struct Reader {
+    dir_path: Arc<PathBuf>,
+    compaction_number: Arc<AtomicU64>,
+    readers: RefCell<HashMap<u64, BufReader<File>>>,
+}
+
+impl Clone for Reader {
+    fn clone(&self) -> Self {
+        Reader {
+            dir_path: Arc::clone(&self.dir_path),
+            compaction_number: Arc::clone(&self.compaction_number),
+            readers: RefCell::new(HashMap::new()),
+        }
+    }
+}
+
+impl Reader {
+    fn try_to_remove_stale_readers(&self) {
+        let compaction_number = self.compaction_number.load(Ordering::SeqCst);
+        let mut readers = self.readers.borrow_mut();
+        while !readers.is_empty() {
+            let reader_number = *readers.keys().next().unwrap();
+            if compaction_number <= reader_number {
+                break;
+            }
+            readers.remove(&reader_number);
+        }
+    }
+
+    fn read_add<F, R>(&self, position: &CommandPosition, f: F) -> Result<R>
+    where
+        F: FnOnce(Take<&mut BufReader<File>>) -> Result<R>,
+    {
+        self.try_to_remove_stale_readers();
+
+        let mut readers = self.readers.borrow_mut();
+
+        if let Entry::Vacant(entry) = readers.entry(position.file_number) {
+            let new_reader = BufReader::new(File::open(
+                &self
+                    .dir_path
+                    .join(format!("data_{}.txt", position.file_number)),
+            )?);
+            entry.insert(new_reader);
+        }
+
+        let source_reader = readers
+            .get_mut(&position.file_number)
+            .expect("Can not find key in files but it is in memory");
+        source_reader.seek(SeekFrom::Start(position.offset))?;
+        let data_reader = source_reader.take(position.length as u64);
+        f(data_reader)
+    }
+
+    fn read_command(&self, position: &CommandPosition) -> Result<Option<String>> {
+        self.read_add(position, |data_reader| {
+            if let Command::SET(_, value) = serde_json::from_reader(data_reader)? {
+                Ok(Some(value))
+            } else {
+                Err(KVStoreError::UnknownCommandType)
+            }
+        })
+    }
+
+    fn copy_data_to_writer(
+        &self,
+        position: &CommandPosition,
+        writer: &mut BufWriterWithPosition<File>,
+    ) -> Result<()> {
+        self.read_add(position, |mut data_reader| {
+            io::copy(&mut data_reader, writer)?;
+            Ok(())
+        })
+    }
+
+    fn remove_useless_reader(&mut self, file_number: u64) -> Result<()> {
+        let mut readers = self.readers.borrow_mut();
+        let delete_file_numbers: Vec<u64> = readers
             .iter()
             .map(|(key, _)| *key)
-            .filter(|key| *key < self.current_file_number)
+            .filter(|key| *key < file_number)
             .collect();
 
         for number in delete_file_numbers {
-            self.current_readers.remove(&number);
-            remove_file(self.dir_path.join(format!("data_{}.txt", number)))?;
+            readers.remove(&number);
+            let file_path = self.dir_path.join(format!("data_{}.txt", number));
+            if let Err(err) = remove_file(&file_path) {
+                warn!("can not delete file {:?} because {}", file_path, err);
+            }
         }
-
-        self.useless_size = 0;
-
-        self.create_new_file()?;
 
         Ok(())
     }
 }
 
-impl KvsEngine for KvStore {
-    /// Set the value of a string key to a string. Return an error if the value is not written successfully.
+struct Writer {
+    dir_path: Arc<PathBuf>,
+    reader: Reader,
+    current_writer: BufWriterWithPosition<File>,
+    current_file_number: u64,
+    useless_size: u64,
+    index: Arc<DashMap<String, CommandPosition>>,
+}
+
+impl Writer {
     fn set(&mut self, key: String, value: String) -> Result<()> {
         let command = Command::SET(key, value);
         let data = serde_json::to_vec(&command)?;
@@ -227,36 +301,22 @@ impl KvsEngine for KvStore {
         }
 
         if self.useless_size > MAX_USELESS_SIZE {
+            let now = SystemTime::now();
+            info!("Compaction starts");
             self.compact()?;
+            info!("Compaction finished, cost {:?}", now.elapsed());
         }
 
         Ok(())
     }
 
-    /// Get the string value of a string key. If the key does not exist, return None. Return an error if the value is not read successfully.
-    fn get(&mut self, key: String) -> Result<Option<String>> {
-        if let Some(position) = self.index.get(&key) {
-            let source_reader = self
-                .current_readers
-                .get_mut(&position.file_number)
-                .expect("Can not find key in files but it is in memory");
-            source_reader.seek(SeekFrom::Start(position.offset))?;
-            let data_reader = source_reader.take(position.length as u64);
-
-            if let Command::SET(_, value) = serde_json::from_reader(data_reader)? {
-                Ok(Some(value))
-            } else {
-                Err(KVStoreError::UnknownCommandType)
-            }
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Remove a given key. Return an error if the key does not exist or is not removed successfully.
     fn remove(&mut self, key: String) -> Result<()> {
         if self.index.get(&key).is_some() {
-            self.useless_size += self.index.remove(&key).map(|cp| cp.length).unwrap_or(0);
+            self.useless_size += self
+                .index
+                .remove(&key)
+                .map(|(_, cp)| cp.length)
+                .unwrap_or(0);
 
             let command = serde_json::to_vec(&Command::RM(key))?;
             let offset = self.current_writer.get_position();
@@ -273,6 +333,50 @@ impl KvsEngine for KvStore {
         } else {
             Err(KVStoreError::KeyNotFound)
         }
+    }
+
+    fn compact(&mut self) -> Result<()> {
+        self.create_new_file()?;
+
+        let mut before_offset = 0;
+        for mut entry in self.index.iter_mut() {
+            let position = entry.value_mut();
+            self.reader
+                .copy_data_to_writer(position, &mut self.current_writer)?;
+            let after_offset = self.current_writer.position;
+            *position = CommandPosition {
+                offset: before_offset,
+                length: after_offset - before_offset,
+                file_number: self.current_file_number,
+            };
+            before_offset = after_offset;
+        }
+        self.current_writer.flush()?;
+
+        self.reader
+            .compaction_number
+            .store(self.current_file_number, Ordering::SeqCst);
+
+        self.reader
+            .remove_useless_reader(self.current_file_number)?;
+
+        self.useless_size = 0;
+
+        self.create_new_file()?;
+
+        Ok(())
+    }
+
+    fn create_new_file(&mut self) -> Result<()> {
+        self.current_file_number += 1;
+        self.current_writer = BufWriterWithPosition::new(
+            OpenOptions::new().create(true).append(true).open(
+                &self
+                    .dir_path
+                    .join(format!("data_{}.txt", self.current_file_number)),
+            )?,
+        )?;
+        Ok(())
     }
 }
 
